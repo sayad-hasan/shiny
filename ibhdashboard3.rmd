@@ -1,0 +1,1068 @@
+---
+title: "IBH well-being mapper"
+output:
+  flexdashboard::flex_dashboard:
+    theme:
+      version: 5
+      bootswatch: zephyr
+runtime: shiny
+---
+
+
+```{r}
+#  functions and Libraries ######
+library(plotly)
+library(shinyWidgets)
+library(flexdashboard)
+library(misty)
+library(shinydashboard)
+library(correlation)
+library(DataExplorer)
+library(funtimes)
+library(Kendall)
+library(nlme)
+library(forecast)
+library(imputeTS)
+library(tidyverse)
+library(DT)
+library(tseries)
+require(gtools)
+library(flextable)
+library(ggcorrplot)
+library(psych)
+library(readit)
+library(FactoMineR)
+library(lavaan)
+library(Conigrave)
+library(Amelia )
+library(Boruta)
+library(gimme)
+library(apaTables)
+library(iml)
+
+library(lattice)
+library(pastecs)
+require (lme4)
+require (arm)
+require(multilevel)
+require(psych)
+require (Hmisc)
+library(data.table)
+library(writexl)
+library(patchwork)
+
+library(ranger)   # a c++ implementation of random forest 
+library(h2o)      # a java-based implementation of random forest
+library(AmesHousing)
+
+library(rsample)   # for resampling procedures
+library(caret)
+library(tree)
+library(randomForest)
+library(party)  ##ctree
+library(MASS) ##messes up your select in some analysis
+library(rpart)
+library(rpart.plot)
+library(sjPlot)
+library(sjmisc)
+library(sjlabelled)
+library(MuMIn)
+library(behaviorchange)
+library(metaforest) 
+# library(grid)
+# library(forestploter)
+
+library(shinybusy)
+```
+
+```{r}
+## Functions
+
+# FUNCTION TO TRAIN A TIME SERIES MODEL
+train_ts <- function(data, ID_number, dep_var, ind_var, 
+                     model_order=NULL, automate=NULL, 
+                     lagged=FALSE){
+  
+  # get data to fit
+  df <- get_data(data=data, ID_number=ID_number, 
+                 dep_var=dep_var, ind_var=ind_var, 
+                 lagged=lagged) 
+  
+  
+  # function to get the input variables 
+  # if time series contains lagged variables
+  if (isTRUE(lagged)){
+    # get column names in data
+    var_names <- names(as.data.frame(df))
+    # remove dependent variable from data
+    input_names <- subset(var_names, !var_names %in% dep_var)
+  }
+  else{
+    input_names <- ind_var
+  }
+  
+  # fit time series
+  if (isTRUE(automate) & is.null(model_order)){
+    fit <- auto.arima(y=df[, dep_var], 
+                      xreg = df[, input_names],
+                      stepwise=FALSE,
+                      approximation=FALSE)
+  } 
+  else if ((is.null(model_order) | isFALSE(model_order)) & 
+           (is.null(automate) | isFALSE(automate))){
+    stop('Both model_order and automate must not be NULL')
+  } 
+  # if model_order is not null but automate is T
+  # can't run both models
+  else if ((!is.null(model_order) | isFALSE(model_order)) & isTRUE(automate)) {
+    stop('One of model_order or automate must be NULL')
+  }
+  else{
+    fit <- Arima(y=df[, dep_var], 
+                 order = model_order, 
+                 xreg = df[, input_names])
+  }
+  return(fit)
+}
+
+
+# FUNCTION TO GET DATA
+get_data <- function(data, ID_number, dep_var, ind_var, lagged=FALSE){
+  # if task is to return a lagged data
+  if (isTRUE(lagged)){
+    df <- data %>%
+      dplyr::filter(ID == ID_number) %>%
+      dplyr::select(dep_var, ind_var) %>%
+      # lag all features
+      dplyr::mutate(across(everything(), lag)) %>%
+      # rename lagged features
+      stats::setNames(paste0(names(.), '_lag'))
+    
+    # bind dependent variable data with lagged features of independent variable
+    df <- dplyr::bind_cols(data[data$ID == ID_number, dep_var], df) %>%
+      ts()
+  }
+  else{
+    df <- data %>%
+      dplyr::filter(ID == ID_number) %>%
+      dplyr::select(all_of(dep_var), dplyr::all_of(ind_var)) %>%
+      ts() 
+  }
+  return(df)
+}
+
+
+# FUNCTION TO GET VARIABLE COEFFICIENTS AND STANDARD ERRORS FOR ONE PARTICIPANT
+get_individual_coefficients_se <- function(data, ID_number, model_order=NULL, 
+                                           automate=NULL, lagged=FALSE){
+  
+  # object to store variable coefficients
+  coef_matrix <- data.frame()
+  se_matrix <- data.frame()
+  
+  
+  for (ind_var in ind_vars()){
+    
+    # for one participant
+    model <- train_ts(data=data, ID_number, dep_var(), ind_var, 
+                      model_order=model_order, 
+                      automate = automate,
+                      lagged=lagged)
+    
+    # get standard errors
+    se <- sqrt(diag(model$var.coef))
+    
+    # get coefficient of each input variable and then their standard errors
+    
+    # if lagged is false, extract xreg
+    if (isFALSE(lagged)){
+      coef_matrix[1, ind_var] <- as.vector(coef(model)['xreg'])
+      se_matrix[1, ind_var] <- as.vector(se['xreg'])
+    }
+    else {
+      coef_matrix[1, paste0(ind_var,'_lag')] <- as.vector(coef(model)[paste0(ind_var,'_lag')])
+      se_matrix[1, paste0(ind_var,'_lag')] <- as.vector(se[paste0(ind_var,'_lag')])
+    }
+  }
+  
+  return(list(coef =coef_matrix, se = se_matrix))
+}
+
+
+
+get_individual_arima_results <- function(data, ID_number, model_order=NULL, 
+                                         automate=NULL, lagged=FALSE){
+  
+  # object to store variable coefficients
+  coef_matrix <- data.frame()
+  se_matrix <- data.frame()
+  phi_mat <- data.frame()
+  delta_mat <- data.frame()
+  theta_mat <- data.frame()
+  
+  for (ind_var in ind_vars()){
+    
+    # for one participant
+    model <- train_ts(data=data, ID_number, dep_var(), ind_var, 
+                      model_order=model_order, 
+                      automate = automate,
+                      lagged=lagged)
+    
+    # get standard errors
+    se <- sqrt(diag(model$var.coef))
+    
+    # get phi, delta and theta values
+    phi <- as.vector(model$model$phi)
+    theta <- as.vector(model$model$theta)
+    delta <- as.vector(model$model$Delta)
+    
+    # get coefficient of each input variable and then their standard errors
+    
+    # if lagged is false, extract xreg
+    if (isFALSE(lagged)){
+      coef_matrix[1, ind_var] <- as.vector(coef(model)['xreg'])
+      se_matrix[1, ind_var] <- as.vector(se['xreg'])
+      phi_mat[1, paste0(ind_var,'_phi')] <- sum(ifelse(phi != 0, 1, 0))
+      theta_mat[1, paste0(ind_var, '_theta')] <- sum(ifelse(theta != 0, 1, 0))
+      delta_mat[1, paste0(ind_var, '_delta')] <- sum(ifelse(delta != 0, 1, 0))
+    }
+    else {
+      coef_matrix[1, paste0(ind_var,'_lag')] <- as.vector(coef(model)[paste0(ind_var,'_lag')])
+      se_matrix[1, paste0(ind_var,'_lag')] <- as.vector(se[paste0(ind_var,'_lag')])
+      phi_mat[1, paste0(ind_var,'_lag_phi')] <- sum(ifelse(phi != 0, 1, 0))
+      theta_mat[1, paste0(ind_var,'_lag_theta')] <- sum(ifelse(theta != 0, 1, 0))
+      delta_mat[1, paste0(ind_var,'_lag_delta')] <- sum(ifelse(delta != 0, 1, 0))
+    }
+  }
+  
+  return(list(coef=coef_matrix, se=se_matrix, phi=phi_mat, theta=theta_mat, delta=delta_mat))
+}
+
+
+
+
+
+# This runs the time series model for all participants
+
+run_all_participants <- function(data,model_order=NULL, automate=F, lagged=F){
+  
+  # GET FOR ALL PARTICIPANTSget for all participants
+  # SET model_order or automate
+  participants_coefficient_matrix <- data.frame()
+  participants_se_matrix <- data.frame()
+  participants_phi_matrix <- data.frame()
+  participants_delta_matrix <- data.frame()
+  participants_theta_matrix <- data.frame()
+  
+  
+  for (id in IDs()){
+    # GET COEFFICIENT MATRIX AND SE FOR EACH PARTICIPANT
+    result_matrix <- get_individual_arima_results(data=data, 
+                                                  ID_number = id, 
+                                                  model_order = model_order, 
+                                                  automate=automate, 
+                                                  lagged=lagged)
+    # MOVE ROWNAMES AS COLUMN
+    coef_matrix <- result_matrix$coef
+    se_matrix <- result_matrix$se
+    phi_mat <- result_matrix$phi
+    theta_mat <- result_matrix$theta
+    delta_mat <- result_matrix$delta
+    
+    # APPEND TO HIGHER MATRIX
+    participants_coefficient_matrix <- append(participants_coefficient_matrix, list(coef_matrix))
+    participants_se_matrix <- append(participants_se_matrix, list(se_matrix))
+    participants_phi_matrix <- append(participants_phi_matrix, list(phi_mat))
+    participants_theta_matrix <- append(participants_theta_matrix, list(theta_mat))
+    participants_delta_matrix <- append(participants_delta_matrix, list(delta_mat))
+  }
+  
+  # RENAME LIST NAMES
+  names(participants_coefficient_matrix) <- IDs()
+  names(participants_se_matrix) <- IDs()
+  names(participants_phi_matrix) <- IDs()
+  names(participants_delta_matrix) <- IDs()
+  names(participants_theta_matrix) <- IDs()
+  
+  # BIND ROWS INTO ONE DATA FRAME
+  participants_coefficient_matrix <- bind_rows(participants_coefficient_matrix, .id = 'ID')
+  participants_se_matrix <- bind_rows(participants_se_matrix, .id = 'ID')
+  participants_phi_matrix <- bind_rows(participants_phi_matrix, .id = 'ID')
+  participants_theta_matrix <- bind_rows(participants_theta_matrix, .id = 'ID')
+  participants_delta_matrix <- bind_rows(participants_delta_matrix, .id = 'ID')
+  
+  return(list(se_mat = participants_se_matrix, coef_mat=participants_coefficient_matrix, 
+              phi=participants_phi_matrix, theta=participants_theta_matrix, 
+              delta=participants_delta_matrix))
+}
+
+
+
+
+
+
+
+
+## BORUTA TASK
+
+run_boruta <- function(data, dep_var, ind_vars){
+  formula_str <- paste0(dep_var, '~ ', paste0(ind_vars, collapse='+'))
+  
+  model_formula <- as.formula(formula_str)
+  
+  # removing every missing values
+  df <- data[complete.cases(data), ]
+  
+  # get unique IDs
+  ids <- unique(df$ID)
+  
+  
+  stat_results <- data.frame() # to get the stats
+  variable_counts <- data.frame() # gets the variable decision and importance of all IDs
+  
+  for (id in IDs()){
+    lborutaData <- df[df$ID == id, ]
+    
+    ##pbat
+    boruta.train <- Boruta(model_formula, data=lborutaData, doTrace=0, maxruns=1000)
+    ##psy flex
+    # boruta.train <- Boruta(model_formula, data=lborutaData, doTrace=3, maxruns=1000)
+    
+    # Get decision stat for each ID
+    Istats <- attStats(boruta.train)
+    Istats$ID <- id
+    
+    # statistics result data frame
+    stat_results <- dplyr::bind_rows(stat_results, Istats)
+    # variable decisions
+    variable_decision <- data.frame(variable = rownames(Istats), 
+                                    meanImp = Istats$meanImp, 
+                                    decision = Istats$decision)
+    
+    # # store variable names and decision
+    variable_counts <- dplyr::bind_rows(variable_counts, variable_decision)
+  }
+  
+  # variable decision counts
+  var_decision_counts <- as.data.frame.array(
+    table(variable_counts$variable, variable_counts$decision)
+  )
+  
+  
+  # Variable Mean importance
+  var_mean_importance <- as.data.frame.array(
+    tapply(X = variable_counts$meanImp, 
+           INDEX = variable_counts[c('variable','decision')], 
+           FUN = mean))
+  
+  
+  # remove numbers and .... from rownames
+  stat_results <- rownames_to_column(var = 'variable', stat_results) %>%
+    mutate(variable = str_remove(variable, '...\\d+'))
+  
+  return (list(stat_results=stat_results, 
+               var_mean_importance=var_mean_importance, 
+               var_decision_counts=var_decision_counts))
+}
+
+
+
+
+# get Random Intercept and Slope
+get_random_intercept_slope <- function(data, model_formula, ind_var){
+  # intercept
+  RandomIntercept <- lme(fixed= model_formula, 
+                         random= ~ 1|ID,
+                         correlation = corAR1(),
+                         data=data,
+                         control=lmeControl(opt='optim'),
+                         na.action=na.exclude)
+  
+  # slope
+  RandomSlope <- lme(fixed= model_formula, 
+                     random= as.formula(paste('~ 1 + scale(',ind_var,') | ID')),
+                     correlation = corAR1(),
+                     data=data,
+                     control = lmeControl(opt='optim'),
+                     na.action=na.exclude)
+  return(list(RandomIntercept, RandomSlope))
+}
+
+
+#### output four types of data files
+run_multi_level <- function(data){
+  #### output four types of data files
+  # R2 difference of Random Intercept and Slope
+  # variable coefficient 
+  # variable Standard Errors (SE)
+  # Anova for Random Intercept and Slope
+  
+  # get the number of rows and cols for matrix
+  # nrows and ncols must be the same
+  nrows <- length(c(dep_var(), ind_vars()))
+  ncols <- length(c(dep_var(), ind_vars()))
+  
+  
+  r2_diff_df <- data.frame(matrix(nrow=nrows, ncol=ncols))
+  var_coeff_df <- data.frame(matrix(nrow = nrows, ncol = ncols))
+  var_SE_df <- data.frame(matrix(nrow = nrows, ncol = ncols))
+  test_result_df <- data.frame(matrix(nrow = nrows, ncol = ncols))
+  
+  
+  # rename columns and rows
+  
+  # column names
+  names(var_coeff_df) <- names(RelateVariables)
+  names(var_SE_df) <- names(RelateVariables)
+  names(test_result_df) <- names(RelateVariables) 
+  names(r2_diff_df) <- names(RelateVariables)
+  
+  # row names
+  rownames(var_coeff_df) <- names(RelateVariables)
+  rownames(var_SE_df) <- names(RelateVariables)
+  rownames(test_result_df) <- names(RelateVariables)
+  rownames(r2_diff_df) <- names(RelateVariables)
+  
+  
+  # model combinations 
+  models <- as.data.frame(gtools::permutations(n=length(names(RelateVariables)), 
+                                               r = 2, v = names(RelateVariables), 
+                                               repeats.allowed = F)
+  )
+  
+  
+  for (idx in 1:nrow(models)){
+    dep_var <- models[idx, 1]
+    ind_var <- models[idx, 2]
+    
+    model_formula <- as.formula(paste0('scale(',dep_var,') ~ ', '1 + scale(',ind_var,')'))
+    
+    # get Random intercept and Slope models
+    intercept_slope_models = get_random_intercept_slope(data, model_formula, ind_var)
+    RandomIntercept = intercept_slope_models[[1]]
+    RandomSlope = intercept_slope_models[[2]]
+    
+    # slope summary
+    summarySlopes = summary(RandomSlope)
+    
+    # coefficient and SE
+    coeff_ <- summarySlopes$tTable[2,1]
+    SE <- summarySlopes$tTable[2,2]
+    
+    # R2 difference
+    r2_diff <- MuMIn::r.squaredGLMM(RandomSlope)[2] - MuMIn::r.squaredGLMM(RandomIntercept)[2] 
+    
+    
+    # ANOVA Result
+    test <- as.data.frame(anova(RandomIntercept,RandomSlope))
+    
+    
+    # replace values
+    var_coeff_df[dep_var, ind_var] = coeff_ # coefficient
+    var_SE_df[dep_var, ind_var] = SE # standard errors
+    r2_diff_df[dep_var, ind_var] = as.vector(r2_diff)  # r2 difference
+    test_result_df[dep_var, ind_var] = test[2, 'L.Ratio'] # anova
+  }
+  return(list(coef_mat = var_coeff_df, se_mat = var_SE_df, 
+              r2_mat = r2_diff_df, test_mat = test_result_df)
+  )
+}
+
+
+
+# Variable Statistics
+
+my.mssd <- function(data){
+  #this computes the difference between each value and the next
+  diffToNext <- data[2:length(data)] - data[1:(length(data)-1)] 
+  diffToNext2 <- diffToNext^2                  # this squares the difference
+  SSdiff <- sum(diffToNext2,na.rm=TRUE)       # this takes the sum of the squared differences
+  denominator <- sum(!is.na(diffToNext))       # this computes the number of non-missing elements (denominator)
+  #which corresponds to the t-1 value
+  mssd <- SSdiff/denominator                   #this computes the MSSD
+  return(mssd)
+}
+
+
+
+get_variable_stat <- function(df){
+  stats <- list(mean(df, na.rm=T), sd(df, na.rm=T), skew(df), 
+                as.vector(kurtosi(df)), sum(!is.na(df)), my.mssd(df))
+  
+  
+  return(as.vector(unlist(stats)))
+}
+
+
+# Function that gets the variable statistics for all participants
+run_all_variable_stat <- function(data){
+  
+  stat_df <- data.frame()
+  
+  
+  for(id in IDs()){
+    
+    df <- data[data$ID == id, c(dep_var, ind_vars())]
+    
+    # gets the statistics for each variable
+    vars_stat = data.frame(apply(df, 2, get_variable_stat))
+    vars_stat$ID <- id
+    vars_stat$stat <- c('mean', 'sd', 'iskew', 'ikurt', 'icount', 'my.mssd')
+    
+    stat_df <- dplyr::bind_rows(stat_df, vars_stat)
+  }
+  # rearrange columns
+  stat_df <- dplyr::select(stat_df, stat, ID, everything())
+  
+  return(stat_df)
+}
+
+```
+
+
+
+Sidebar {.sidebar}
+=====================================
+
+
+```{css, echo = F}
+.shiny-input-panel {
+    padding: 6px 0px;
+    margin-top: 0px;
+    margin-bottom: 0px;
+    background-color: #ffffff;
+    border: 1px solid #ffffff;
+    border-radius: 0;
+}
+
+.shiny-flow-layout > div {
+    display: inline-block;
+    vertical-align: top;
+    padding-right: 12px;
+    width: 240px;
+}
+```
+
+
+```{r}
+# shiny inputs defined here
+options(warn = -1) 
+
+
+#### File input button --------------------------------------------------------
+
+fileInput("file1", "Choose CSV File",
+          multiple = TRUE,
+          accept = c("text/csv",
+                     "text/comma-separated-values,text/plain",
+                     ".csv")
+          )
+
+values <- reactiveValues(df_data = NULL)
+
+observeEvent(input$file1, {
+  values$df_data <- read.csv(input$file1$datapath)
+})
+
+
+data <- reactive({
+  values$df_data
+})
+
+#### Dependent variable select button -----------------------------------------
+variables <- reactive(colnames(data()))
+
+uiOutput("DVOutput")
+output[["DVOutput"]] <- renderUI({
+  selectInput(inputId = "depenVariable", 
+              label = "What outcome would you like to focus on?", 
+              choices = variables(), 
+              selected = variables()[3],
+              multiple = F)
+})
+
+observe({
+    if(!is.null(input$indiVariables))
+      updateSelectInput(session, "depenVariable", 
+                        choices = variables()[!(variables() %in% input$indiVariables)], 
+                        selected = isolate(input$depenVariable))
+  })
+
+dep_var <- eventReactive(input$execute, {
+  input$depenVariable
+})
+
+
+#### Independent variable select button ---------------------------------------
+
+uiOutput("IVOutput")
+output[["IVOutput"]] <- renderUI({
+  selectInput(inputId = "indiVariables", 
+              label = "What processes would you like focus on?", 
+              choices = variables(), 
+              multiple = T)
+})
+
+observe({
+    if(!is.null(input$depenVariable))
+      updateSelectInput(session, "indiVariables", 
+                        choices = variables()[!(variables() %in% input$depenVariable)], 
+                        selected = isolate(input$indiVariables))
+  })
+
+ind_vars <- eventReactive(input$execute, {
+  input$indiVariables
+})
+
+
+
+#### Individual ID select button ----------------------------------------------
+
+uiOutput("select")
+output[["select"]] <- renderUI({
+  selectInput("individual", label = "Select Individual",
+          choices = unique(data()$ID))
+})
+
+
+#### Action button to run the analysis ----------------------------------------
+
+actionButton("execute", "Run Analysis",class = "run-button",
+             icon = icon("play-circle"),
+             style="width:100%; position: relative;")
+
+uiOutput("message")
+output[["message"]] <- renderUI({
+  ifelse(input$execute==0, 
+           "Press \"Run Analysis\" Button to Start", 
+           "")
+})
+```
+
+
+
+```{r}
+FocusData <- eventReactive(input$execute, {
+  data() %>% filter(ID %in% input$individual)
+})
+
+IDs <- reactive({
+  unique(FocusData()$ID)
+})
+
+
+### for forest plot 
+
+arima_summary <- eventReactive(input$execute, {
+  scaled_data_by_id <- FocusData() %>%
+    dplyr::group_by(ID) %>%
+    dplyr::select(ID, dplyr::all_of(c(dep_var(), ind_vars()))) %>%
+    dplyr::mutate(across(.cols=everything(), scale)) %>%
+    as.vector() %>%
+    as.data.frame() %>%
+    ungroup()
+
+
+  results = run_all_participants(scaled_data_by_id, model_order=NULL, 
+                                 automate = T, lagged = F)
+
+  ##person centered, long format
+  arima_summary <- tidyr::pivot_longer(results$se_mat, cols = -ID, 
+                                       names_to = 'variable',
+                                     values_to = 'arima.SE') %>%
+  dplyr::inner_join(tidyr::pivot_longer(results$coef_mat, cols = -ID, 
+                                        names_to = 'variable',
+                                        values_to = 'arima.coef'),
+                    by=c('ID', 'variable')) %>% 
+    mutate(Tvalue = arima.coef/arima.SE)
+
+  arima_summary
+})
+
+
+## Boruta results 
+boruta_results <- eventReactive(input$execute, {
+    # Implement boruta
+  set.seed(8675309)
+
+  boruta_results <- run_boruta(FocusData(), dep_var(), ind_vars())
+  
+  boruta_results$stat_results
+})
+```
+
+
+
+View Data {style="position:relative;"}
+=====================================  
+
+
+
+```{r}
+add_busy_spinner(spin = "fading-circle", position = "top-left")
+
+renderDataTable({
+  datatable(FocusData())
+})
+```
+
+
+
+Graphs 
+===================================== 
+
+
+```{r}
+fillCol(height = 600, flex = c(NA, 1), 
+  inputPanel(
+    uiOutput("outcome_select"), 
+    uiOutput("process_select")
+  ),
+  
+  plotlyOutput("plot", height = "100%")
+
+)
+```
+
+ 
+
+```{r}
+output[["outcome_select"]] <- renderUI({
+  selectInput(inputId = "outcome", label = "Select Outcome", 
+            choices = variables(), selected = variables()[3])
+})
+
+output[["process_select"]] <- renderUI({
+  selectInput(inputId = "process", label = "Select Process", 
+            choices = variables(), selected = variables()[4])
+})
+```
+
+
+
+```{r}
+add_busy_spinner(spin = "fading-circle", position = "top-left")
+
+observeEvent(input$file1,{
+  output[["plot"]] <- renderPlotly({
+  
+  PlotData<-data() %>% 
+    filter(ID %in% input$individual) %>% 
+    dplyr::select(Time,input$outcome,input$process)%>%
+    na_interpolation
+
+  ggplot(data = PlotData, aes(x = Time)) +
+    geom_line(aes(y = get(input$outcome), colour = input$outcome)) +
+    geom_line(aes(y = get(input$process), colour = input$process)) +
+    scale_colour_manual("",
+                        breaks = c(input$outcome, input$process),
+                        values = c("red", "blue")
+                        ) +
+    xlab(" ") +
+    scale_y_continuous("Intensity", limits = c(0,100)) +
+    labs(title="Outcome and process over time")+
+    theme(plot.title=element_text(hjust=0.5))
+
+  })
+
+})
+
+```
+
+
+Forest Plot
+=====================================     
+
+    
+```{r}
+add_busy_spinner(spin = "fading-circle", position = "top-left")
+
+plotOutput("plot3")
+
+output[["plot3"]] <- renderPlot({
+
+  if(is.null(arima_summary())){
+    # if model is not run yet, show nothing
+    invisible()
+  }else{
+    # if everything is ok then proceed with the plot
+    dat <- arima_summary() %>%
+      mutate(
+        L = round(arima.coef - 2 * arima.SE, 3),
+        U = round(arima.coef + 2 * arima.SE, 3),
+        CI = paste0(round(arima.coef, 2), " [", L, ", ", U, "]"),
+        Index = 1:nrow(arima_summary()),
+        errcol = ifelse((L < 0 & U < 0) |
+                          (L > 0 & U > 0), "Yes", "No")
+      ) %>%
+      dplyr::select(Index, variable, Coef = arima.coef, SE = arima.SE,
+                    L, U, CI, errcol)
+
+    # making plot
+    p1 <- dat %>%
+      ggplot(aes(y = Index, x = Coef)) +
+      geom_point(aes(size = abs(Coef), col = errcol),
+                 shape = 15) +
+      geom_errorbarh(aes(xmin = L, xmax = U, color = errcol),
+                     height = 0.25) +
+      geom_vline(
+        xintercept = 0, color = "red",
+        linetype = "dashed", cex = 1, alpha = 0.5 ) +
+      xlab("Observed Outcome") +
+      ylab(" ") +
+      scale_color_manual(values=c("Yes" = "#009E73",
+                                  "No" = "red")) +
+      theme(
+        panel.border = element_blank(),
+        panel.background = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(colour = "black"),
+        axis.text.y = element_text(size = 12,
+                                   colour = "black"),
+        axis.text.x.bottom = element_text(size = 12,
+                                          colour = "black"),
+        axis.title.x = element_text(size = 12,
+                                    colour = "black"),
+        legend.position = "none",
+        axis.ticks.y = element_blank(),
+        axis.line.y.right = element_blank(),
+        axis.text.y.right = element_text(hjust = 0.5)
+      ) +
+      # https://stackoverflow.com/questions/45361904/duplicating-and-modifying-discrete-axis-in-ggplot2
+      # adding 95% CI as a secondary axis
+      scale_y_continuous(
+        breaks = 1:nrow(dat),
+        labels = dat$variable,
+        trans = "reverse",
+        sec.axis = sec_axis( ~ .,
+                             breaks = 1:nrow(dat),
+                             labels = dat$CI)
+      )
+
+    # returning the plot
+    p1
+  }  # loop ends
+
+})  # renderPlot ends
+
+```
+
+
+   
+I-boruta Machine Learning
+=====================================     
+
+### IBoruta
+    
+```{r}
+add_busy_spinner(spin = "fading-circle", position = "top-left")
+
+plotlyOutput("plot2")
+
+output[["plot2"]] <- renderPlotly({
+
+  # creating ggplot
+  p <- boruta_results() %>%
+    mutate(decision = factor(decision, 
+                             # ordering the decision for better visualization
+                             levels = c("Confirmed", "Tentative", "Rejected"))) %>% 
+    ggplot(aes(x = meanImp, 
+               # ordering the bars from high to low by the value of meanImp
+               y = reorder(variable, meanImp), 
+               fill = decision, 
+               text = paste("Decision:", decision, 
+                            "\nmeanImp:",round(meanImp, 3)))) +
+    # the text argument is specific for the tooltip in plotly
+    geom_col() +
+    # manually changing color for each decision
+    scale_fill_manual(values = c("Confirmed" = "#87bc45", 
+                                 "Tentative" = "#edbf33", 
+                                 "Rejected" = "#ea5545")) +
+    # giving labels to x axis, y axis and legend (fill)
+    labs(x = "Mean Importance", y = "", fill = "Decision") +
+    # using minimal theme
+    theme_minimal()
+  
+  # converting it to plotly and adding a tooltip from the text argument
+  ggplotly(p, tooltip = c("text"))
+})
+```
+
+
+Decision Tree {style="position:relative;"}
+=====================================     
+
+Column
+--------------------------------------------------------
+
+```{r}
+add_busy_spinner(spin = "fading-circle", position = "top-left")
+
+fillCol(height = 600, flex = c(2,2,7),
+        
+  fillRow(
+    uiOutput("selectCP"),
+    uiOutput("confirmed_UI"),
+    uiOutput("tentative_UI")
+  ),
+        
+  fillRow(
+    uiOutput("execute2"),
+    uiOutput("significant_UI"),
+    uiOutput("dependent_UI")
+  ),
+  
+  fillRow(
+      plotOutput("decisionTree", height=600)
+  )
+)
+
+boruta_tab <- reactive({
+  
+  # creating ggplot
+  boruta_results() %>%
+    mutate(decision = factor(decision, 
+                             # ordering the decision for better visualization
+                             levels = c("Confirmed", 
+                                        "Tentative", 
+                                        "Rejected")))
+})
+
+output[["confirmed_UI"]] <- renderUI({
+  choices = boruta_tab()$variable[boruta_tab()$decision=="Confirmed"]
+  pickerInput("confirmed","Confirmed",
+              choices = choices,
+              options = list(
+                `actions-box` = TRUE,
+                `deselect-all-text` = "Select None",
+                `select-all-text` = "Select All",
+                `none-selected-text` = ifelse(length(choices)==0,
+                                              "No variable",
+                                              paste(length(choices), "Options")),
+                `selected-text-format`= "count",
+                `count-selected-text` = "{0} Selected"
+                ),
+              multiple = TRUE)
+  })
+output[["tentative_UI"]] <- renderUI({
+  choices = boruta_tab()$variable[boruta_tab()$decision=="Tentative"]
+  pickerInput("tentative","Tentative",
+              choices = choices,
+              options = list(
+                `actions-box` = TRUE,
+                `deselect-all-text` = "Select None",
+                `select-all-text` = "Select All",
+                `none-selected-text` = ifelse(length(choices)==0,
+                                              "No variable",
+                                              paste(length(choices), "Options")),
+                `selected-text-format`= "count",
+                `count-selected-text` = "{0} Selected"
+                ),
+              multiple = TRUE)
+})
+output[["significant_UI"]] <- renderUI({
+  
+  arima_sig <- arima_summary() %>% 
+    mutate(L = round(arima.coef - 2 * arima.SE, 3),
+           U = round(arima.coef + 2 * arima.SE, 3),
+           Decision = ifelse((L < 0 & U < 0) |
+                               (L > 0 & U > 0), "Significant", "Insignificant")) %>% 
+    dplyr::filter(Decision == "Significant") %>% 
+    dplyr::select(variable) %>% 
+    as.vector()
+  
+  choices = arima_sig$variable
+    
+  pickerInput("significant","Significant in ARIMA",
+              choices = choices,
+              options = list(
+                `actions-box` = TRUE,
+                `deselect-all-text` = "Select None",
+                `select-all-text` = "Select All",
+                `none-selected-text` = ifelse(length(choices)==0,
+                                              "No variable",
+                                              paste(length(choices), "Options")),
+                `selected-text-format`= "count",
+                `count-selected-text` = "{0} Selected"
+                ),
+              multiple = TRUE)
+})
+output[["dependent_UI"]] <- renderUI({
+  pickerInput("dependent","Dependent",
+              choices = variables()[!variables() %in% boruta_tab()$variable],
+              selected = dep_var(),
+              options = list(
+                `actions-box` = TRUE,
+                `none-selected-text` = "Select One"
+                ),
+              multiple = F)
+})
+output[["execute2"]] <- renderUI({
+  input$execute
+  req(input$execute)
+  isolate({
+      actionButton("plotTree", "Plot Decision Tree",
+                   class = "run-button",
+                   icon = icon("play-circle"),
+                   style="width:90%; position: relative;")
+  })
+})
+
+output[["selectCP"]] <- renderUI({
+  input$execute
+  req(input$execute)
+  
+  isolate({
+    sliderInput("cp","Complexity Parameter",
+                min=0.0001, max=0.3, value = 0.001, step = 0.001) 
+    })
+})
+
+output[["decisionTree"]] <- renderPlot({
+  
+  input$plotTree
+  req(input$plotTree)
+  
+  isolate({
+    if(is.null(input$confirmed) & 
+       is.null(input$tentative) & 
+       is.null(input$significant)){
+      
+      Treedata_OBT5<- FocusData() %>%
+        dplyr::select(dep_var(), ind_vars())
+  
+      formula_rpart <- as.formula(paste(dep_var(), "~."))
+      understandable.model <- rpart(formula_rpart, 
+                                    Treedata_OBT5, cp = input$cp)
+      
+      rpart.plot(understandable.model, 
+                 main = paste("Decision Tree with", input$cp, "complexity"),
+                 type = 5,
+                 clip.right.labs = FALSE,
+                 under = TRUE, branch.lty = 3)
+      
+    }else{
+      
+      dep_var = input$dependent
+      ind_vars = unique(c(input$confirmed, input$tentative, input$significant))
+      
+      Treedata_OBT5<- FocusData() %>%
+        dplyr::select(dep_var, ind_vars)
+  
+      formula_rpart <- as.formula(paste(dep_var, "~."))
+      understandable.model <- rpart(formula_rpart, 
+                                    Treedata_OBT5, cp = input$cp)
+      
+      rpart.plot(understandable.model, 
+                 main = paste("Decision Tree with", input$cp, "complexity"),
+                 type = 5,
+                 clip.right.labs = FALSE,
+                 under = TRUE, branch.lty = 3)
+    }
+    
+  })
+  
+})
+```
+
